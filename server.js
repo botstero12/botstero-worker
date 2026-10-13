@@ -6,29 +6,48 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Semáforo para que Render no ejecute 2 Chromium al mismo tiempo (evita colapso por RAM)
+let isProcessing = false;
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
+  res.json({ status: 'ok', busy: isProcessing, time: new Date().toISOString() });
 });
 
 app.get('/api/get-session', async (req, res) => {
   const targetUrl = req.query.url;
+
   if (!targetUrl || !targetUrl.startsWith('http')) {
     return res.status(400).json({ error: 'Falta el parámetro url o es inválido' });
   }
 
-  // Tiempo máximo total a esperar en la fila (en milisegundos). Default: 5 minutos.
-  const MAX_WAIT_MS = parseInt(req.query.maxWait || '300000', 10);
-  const POLL_INTERVAL_MS = 3000;
+  if (isProcessing) {
+    return res.status(429).json({ 
+      error: 'El servicio está ocupado procesando otra sesión. Reintentá en unos segundos.' 
+    });
+  }
 
+  isProcessing = true;
   let browser = null;
+
+  // Tiempo máximo de espera en milisegundos (por defecto 120s para no exceder los límites de Render)
+  const MAX_WAIT_MS = parseInt(req.query.maxWait || '120000', 10);
+  const POLL_INTERVAL_MS = 2500;
+  const startTime = Date.now();
+
   try {
+    console.log(`[Queue-IT] Iniciando navegador liviano para: ${targetUrl}`);
+
     browser = await chromium.launch({
       headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process', // Clave: evita disparar múltiples procesos en los 512MB de Render
+        '--disable-extensions',
+        '--disable-accelerated-2d-canvas'
       ]
     });
 
@@ -39,54 +58,43 @@ app.get('/api/get-session', async (req, res) => {
 
     const page = await context.newPage();
 
-    console.log(`[Queue-IT] Navegando hacia: ${targetUrl}`);
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Navegación con timeout prudencial
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-    const startTime = Date.now();
     let acceptedCookie = null;
     let allCookies = [];
 
-    // Bucle de espera activa: consulta las cookies periódicamente hasta que aparezca QueueITAccepted
+    // Bucle de espera activa hasta encontrar la cookie específica
     while (Date.now() - startTime < MAX_WAIT_MS) {
       allCookies = await context.cookies();
 
-      // Busca específicamente la cookie que valida el pase de la fila
+      // Busca específicamente la cookie QueueITAccepted o que contenga el EventId firmado
       acceptedCookie = allCookies.find(c => 
-        c.name.startsWith('QueueITAccepted') ||
+        c.name.startsWith('QueueITAccepted') || 
         (c.name.toLowerCase().includes('queueit') && c.value.includes('EventId'))
       );
 
-      // Si ya la encontró o si la URL final ya no está en el dominio de queue-it
-      const currentUrl = page.url();
-      const leftQueueDomain = !currentUrl.includes('queue-it.net') && !currentUrl.includes('queueit');
-
       if (acceptedCookie) {
-        console.log(`[Queue-IT] ¡Cookie conseguida tras ${(Date.now() - startTime) / 1000}s!`);
+        console.log(`[Queue-IT] Cookie encontrada tras ${(Date.now() - startTime) / 1000}s`);
         break;
       }
 
-      // Si ya salió de la fila pero la cookie tiene otro nombre, revisamos si volvió al sitio original
-      if (leftQueueDomain && currentUrl.includes('bocasocios') && allCookies.length > 0) {
-        console.log(`[Queue-IT] Redirigido fuera de Queue-it hacia: ${currentUrl}`);
-        break;
-      }
-
-      // Espera antes de volver a verificar el estado
       await page.waitForTimeout(POLL_INTERVAL_MS);
     }
 
+    const currentUrl = page.url();
     await browser.close();
+    browser = null;
 
     if (!acceptedCookie) {
       return res.status(408).json({
-        error: 'Tiempo de espera agotado en la fila virtual sin obtener QueueITAccepted',
+        error: 'Tiempo de espera agotado sin obtener QueueITAccepted',
         waitedSeconds: (Date.now() - startTime) / 1000,
-        currentUrl: page.url(),
+        currentUrl,
         availableCookies: allCookies.map(c => c.name)
       });
     }
 
-    // Devuelve el formato esperado por el bot
     return res.json({
       success: true,
       name: acceptedCookie.name,
@@ -97,9 +105,13 @@ app.get('/api/get-session', async (req, res) => {
     });
 
   } catch (error) {
-    if (browser) await browser.close();
-    console.error('[Error Queue-IT]', error);
+    console.error('[Error Worker]', error.message);
+    if (browser) {
+      try { await browser.close(); } catch (_) {}
+    }
     return res.status(500).json({ error: error.message });
+  } finally {
+    isProcessing = false;
   }
 });
 
